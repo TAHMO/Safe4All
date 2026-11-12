@@ -65,11 +65,19 @@ and land-use susceptibility scores are in `safe4all/config.py`.
 
 ## Outputs
 
-- **Google Drive** (`SAFE4ALL_Flood_Drought_Risk`): GeoTIFFs of hazard,
-  exposure, vulnerability, risk index and risk class for flood, drought and
-  multi-hazard, the separate exposure layers (population per km2, cropland
-  and settlement cover fractions, infrastructure index), plus the district
-  statistics as CSV and Shapefile.
+- **GeoTIFFs** (`outputs/<study area>/geotiff/`, `SAVE_GEOTIFFS = True`):
+  hazard, exposure, vulnerability, risk index and risk class for flood,
+  drought and multi-hazard, Sentinel-1 flood frequency, and the separate
+  exposure layers (population per km2, cropland and settlement cover
+  fractions, infrastructure index). Downloaded directly from Earth Engine,
+  so they are also in the zip. Each file must stay under Earth Engine's
+  ~32 MB download limit (a whole country at 1 km fits easily); a layer that
+  is too large is skipped with a message, so raise `EXPORT_SCALE` for it.
+- **Google Drive export** (`EXPORT_TO_DRIVE = True`, off by default): the same
+  GeoTIFFs plus district statistics as Earth Engine tasks to
+  `SAFE4ALL_Flood_Drought_Risk` in the Drive of the signed-in account. With
+  the workshop service-account key that is the service account's own Drive,
+  which nobody can open, so only use it when signed in with your own account.
 - **Workshop cache** (`outputs/<study area>/`): district risk statistics CSV
   (with population per km2, cropland %, settlement % and infrastructure index per district),
   zipped shapefile, interactive district map (self-contained HTML), interactive

@@ -437,6 +437,64 @@ def export_geotiffs(ee, rasters: dict, prefix: str, folder: str, region, scale: 
     return tasks
 
 
+GEOTIFF_NODATA = -9999  # index/value layers; class layers use 0 (classes are 1-5)
+
+
+def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, scale: int = 1000,
+                      fetch=None, log=print) -> list:
+    """Download each raster as a GeoTIFF straight into ``out_dir`` (no Drive export needed).
+
+    Earth Engine's direct download is limited to about 32 MB per file, which a
+    country at 1 km easily fits (Kenya is ~5 MB per Float32 layer). A layer that is
+    too large, or fails for any other reason, is reported and skipped; raise
+    ``EXPORT_SCALE`` or use the Drive export for it. Masked pixels are written as
+    ``GEOTIFF_NODATA`` (0 for class layers) and tagged as nodata when rasterio is
+    available.
+    """
+    if fetch is None:
+        import requests
+
+        def fetch(url):
+            response = requests.get(url, timeout=600)
+            response.raise_for_status()
+            return response.content
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for name, image in rasters.items():
+        is_class = name.endswith("_class")
+        nodata = 0 if is_class else GEOTIFF_NODATA
+        image = ee.Image(image).unmask(nodata)
+        image = image.toByte() if is_class else image.toFloat()
+        path = out_dir / f"{prefix}_{name}.tif"
+        try:
+            url = image.getDownloadURL({"name": f"{prefix}_{name}", "region": region, "scale": scale,
+                                        "crs": "EPSG:4326", "format": "GEO_TIFF"})
+            path.write_bytes(fetch(url))
+        except Exception as error:
+            log(f"GeoTIFF skipped: {name} ({str(error)[:150]})")
+            continue
+        _tag_nodata(path, nodata)
+        saved.append(path)
+        log(f"Saved GeoTIFF: {path.name}")
+    log(f"{len(saved)} of {len(rasters)} GeoTIFF(s) saved to {out_dir}")
+    return saved
+
+
+def _tag_nodata(path: Path, nodata) -> None:
+    """Record the nodata value in the GeoTIFF so GIS software hides masked pixels (needs rasterio)."""
+    try:
+        import rasterio
+    except ImportError:
+        return
+    try:
+        with rasterio.open(path, "r+") as dataset:
+            dataset.nodata = nodata
+    except Exception:
+        pass
+
+
 def export_tables(ee, collection, prefix: str, folder: str, formats=("CSV", "SHP")) -> list:
     tasks = []
     for fmt in formats:

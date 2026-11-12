@@ -272,6 +272,48 @@ class RiskWorkflowTests(unittest.TestCase):
         finally:
             ee_tools.PRECOMPUTE_STATS = original
 
+    def test_geotiffs_download_into_the_output_folder(self):
+        from safe4all.export import GEOTIFF_NODATA, download_geotiffs
+
+        class Image:
+            def __init__(self, name, too_big=False):
+                self.name, self.too_big, self.nodata, self.dtype = name, too_big, None, None
+
+            def unmask(self, value):
+                self.nodata = value
+                return self
+
+            def toByte(self):
+                self.dtype = "byte"
+                return self
+
+            def toFloat(self):
+                self.dtype = "float"
+                return self
+
+            def getDownloadURL(self, params):
+                if self.too_big:
+                    raise RuntimeError("Total request size must be less than or equal to 33554432 bytes.")
+                assert params["format"] == "GEO_TIFF" and params["scale"] == 1000
+                return f"https://ee/{self.name}"
+
+        class FakeEE:
+            def Image(self, image):
+                return image
+
+        images = {"flood_risk": Image("flood_risk"), "flood_risk_class": Image("flood_risk_class"),
+                  "huge": Image("huge", too_big=True)}
+        messages = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            saved = download_geotiffs(FakeEE(), images, Path(tmp_dir) / "geotiff", "Ghana", region=None,
+                                      fetch=lambda url: url.encode(), log=messages.append)
+            self.assertEqual([p.name for p in saved], ["Ghana_flood_risk.tif", "Ghana_flood_risk_class.tif"])
+            self.assertEqual(saved[0].read_bytes(), b"https://ee/flood_risk")
+        self.assertEqual((images["flood_risk"].nodata, images["flood_risk"].dtype), (GEOTIFF_NODATA, "float"))
+        self.assertEqual((images["flood_risk_class"].nodata, images["flood_risk_class"].dtype), (0, "byte"))
+        self.assertTrue(any(m.startswith("GeoTIFF skipped: huge") for m in messages))
+        self.assertIn("2 of 3 GeoTIFF(s) saved", messages[-1])
+
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]
         self.assertEqual(assign_classes(values), ["Very Low", "Very High", "No data", "Moderate", "Moderate"])
