@@ -391,6 +391,36 @@ class RiskWorkflowTests(unittest.TestCase):
             self.assertIn(field, FIELD_DESCRIPTIONS)
             self.assertLessEqual(len(field), 10, field)
 
+    def test_roads_are_dropped_only_when_too_large_for_the_study_area(self):
+        from safe4all.exposure import roads_usable
+
+        class Roads:
+            def toFloat(self):
+                return self
+
+            def getDownloadURL(self, params):
+                return "https://ee/roads"
+
+        class FakeEE:
+            def Image(self, image):
+                return image
+
+        def failing(message):
+            def fetch(url):
+                raise RuntimeError(message)
+            return fetch
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(roads_usable(FakeEE(), Roads(), None, fetch=lambda url: b"tif"))
+            self.assertFalse(roads_usable(FakeEE(), Roads(), None,
+                                          fetch=failing("HTTP 400: Object too large (142340800 bytes).")))
+            self.assertFalse(roads_usable(FakeEE(), Roads(), None,
+                                          fetch=failing("HTTP 400: User memory limit exceeded.")))
+            # A busy project (429) is not a reason to change the method.
+            self.assertTrue(roads_usable(FakeEE(), Roads(), None,
+                                         fetch=failing("HTTP 429: Too Many Requests")))
+        self.assertIn("night-time lights only", out.getvalue())
+
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]
         self.assertEqual(assign_classes(values), ["Very Low", "Very High", "No data", "Moderate", "Moderate"])

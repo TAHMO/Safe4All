@@ -62,6 +62,42 @@ def road_density(ee, region, scale: int = 1000):
             .reproject(crs="EPSG:4326", scale=scale).rename("road_density").clip(region))
 
 
+def roads_usable(ee, roads, region, scale: int = 1000, fetch=None) -> bool:
+    """True if Earth Engine can compute ``roads`` for the whole study area in one request.
+
+    Drawing GRIP4 roads loads the whole Africa road table; for a whole country this
+    can exceed Earth Engine's object-size or memory limit ("Object too large"),
+    which would then break every exposure, risk and GeoTIFF output that uses it.
+    Map tiles still work, so the failure only shows up in whole-area requests;
+    this probe makes one such request now.
+    """
+    if fetch is None:
+        import requests
+
+        def fetch(url):
+            response = requests.get(url, timeout=600)
+            if response.status_code >= 400:
+                try:
+                    detail = response.json()["error"]["message"]
+                except Exception:
+                    detail = response.text[:200]
+                raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+            return response.content
+    try:
+        url = ee.Image(roads).toFloat().getDownloadURL(
+            {"region": region, "scale": scale, "crs": "EPSG:4326", "format": "GEO_TIFF"})
+        fetch(url)
+        return True
+    except Exception as error:
+        message = str(error)
+        if "too large" in message.lower() or "memory" in message.lower():
+            print(f"GRIP4 roads are too large to process for this whole study area ({message[:80]}); "
+                  "infrastructure uses night-time lights only. Roads work for smaller areas (admin1, district).")
+            return False
+        print(f"  roads check inconclusive ({message[:80]}); roads kept.")
+        return True
+
+
 def exposure_indicators(ee, region, population_year: int = 2020, nightlights_year: int = 2023,
                         scale: int = 1000, use_roads: bool = True, flood_weights=None, drought_weights=None):
     """Compute Step 6 exposure layers and the flood- and drought-specific exposure indices."""
@@ -71,6 +107,8 @@ def exposure_indicators(ee, region, population_year: int = 2020, nightlights_yea
     lights = nightlights(ee, nightlights_year)
     lights_index = minmax(ee, lights.add(1).log(), region, scale, "nightlights")
     roads = road_density(ee, region, scale) if use_roads else None
+    if roads is not None and not roads_usable(ee, roads, region, scale):
+        roads = None
     infrastructure = lights_index if roads is None else lights_index.add(minmax(ee, roads, region, scale, "roads")).divide(2)
 
     index = {
