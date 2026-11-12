@@ -311,8 +311,85 @@ class RiskWorkflowTests(unittest.TestCase):
             self.assertEqual(saved[0].read_bytes(), b"https://ee/flood_risk")
         self.assertEqual((images["flood_risk"].nodata, images["flood_risk"].dtype), (GEOTIFF_NODATA, "float"))
         self.assertEqual((images["flood_risk_class"].nodata, images["flood_risk_class"].dtype), (0, "byte"))
-        self.assertTrue(any(m.startswith("GeoTIFF skipped: huge") for m in messages))
+        self.assertTrue(any(m.startswith("Direct download failed: huge") for m in messages))
         self.assertIn("2 of 3 GeoTIFF(s) saved", messages[-1])
+
+    def test_heavy_geotiffs_fall_back_to_batch_tasks_and_temporary_assets(self):
+        from safe4all.export import download_geotiffs
+
+        class Image:
+            def __init__(self, name, heavy=False):
+                self.name, self.heavy = name, heavy
+
+            def unmask(self, value):
+                return self
+
+            def toByte(self):
+                return self
+
+            def toFloat(self):
+                return self
+
+            def getDownloadURL(self, params):
+                if self.heavy:
+                    raise RuntimeError("HTTP 503: Computation timed out.")
+                return f"https://ee/{self.name}"
+
+        class Task:
+            def __init__(self, asset_id, states):
+                self.asset_id, self.states = asset_id, list(states)
+
+            def start(self):
+                pass
+
+            def status(self):
+                return {"state": self.states.pop(0) if len(self.states) > 1 else self.states[0]}
+
+        created, deleted, started = [], [], {}
+
+        class FakeEE:
+            class data:
+                @staticmethod
+                def createAsset(value, path):
+                    created.append(path)
+
+                @staticmethod
+                def deleteAsset(path):
+                    deleted.append(path)
+
+            class batch:
+                class Export:
+                    class image:
+                        @staticmethod
+                        def toAsset(image, assetId, **kwargs):
+                            states = ["FAILED"] if image.name == "broken" else ["READY", "RUNNING", "COMPLETED"]
+                            started[image.name] = Task(assetId, states)
+                            return started[image.name]
+
+            def Image(self, image):
+                return Image(image.split("/")[-1]) if isinstance(image, str) else image
+
+        images = {"population": Image("population"), "drought_hazard": Image("drought_hazard", heavy=True),
+                  "broken": Image("broken", heavy=True)}
+        messages = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            saved = download_geotiffs(FakeEE(), images, Path(tmp_dir), "Ghana", region=None,
+                                      fetch=lambda url: url.encode(), log=messages.append,
+                                      asset_folder="projects/p/assets/safe4all_exports", sleep=lambda _: None)
+            self.assertEqual(sorted(p.name for p in saved), ["Ghana_drought_hazard.tif", "Ghana_population.tif"])
+            self.assertEqual((Path(tmp_dir) / "Ghana_drought_hazard.tif").read_bytes(), b"https://ee/drought_hazard")
+        self.assertEqual(sorted(started), ["broken", "drought_hazard"])  # only failed layers become tasks
+        run = created[1]
+        self.assertTrue(run.startswith("projects/p/assets/safe4all_exports/Ghana_"))
+        self.assertIn(f"{run}/drought_hazard", deleted)  # temporary asset removed after download
+        self.assertIn("2 of 3 GeoTIFF(s) saved", messages[-1])
+
+    def test_district_table_includes_vulnerability_components(self):
+        from safe4all.export import VULNERABILITY_FIELDS
+
+        for field in VULNERABILITY_FIELDS:
+            self.assertIn(field, FIELD_DESCRIPTIONS)
+            self.assertLessEqual(len(field), 10, field)
 
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]

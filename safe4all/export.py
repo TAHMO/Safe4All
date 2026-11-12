@@ -23,7 +23,13 @@ FIELD_DESCRIPTIONS = {
     "dr_risk": "drought_risk_index", "dr_class": "drought_risk_class", "dr_rank": "drought_risk_rank",
     "dr_hi_pct": "drought_high_veryhigh_area_pct", "pop_dr_hi": "drought_high_veryhigh_population",
     "mh_risk": "multi_hazard_risk_index", "mh_class": "multi_hazard_risk_class", "mh_rank": "multi_hazard_risk_rank",
+    # vulnerability components (0-1); v_poverty is empty unless POVERTY_CSV is set
+    "v_socio": "vuln_socioeconomic_mean", "v_health": "vuln_health_access_mean",
+    "v_remote": "vuln_remoteness_mean", "v_depriv": "vuln_deprivation_mean", "v_poverty": "vuln_poverty_mean",
+    "v_fl_land": "vuln_flood_land_use_mean", "v_dr_land": "vuln_drought_land_use_mean",
+    "v_agri": "vuln_agricultural_dependence_mean",
 }
+VULNERABILITY_FIELDS = ["v_socio", "v_health", "v_remote", "v_depriv", "v_poverty", "v_fl_land", "v_dr_land", "v_agri"]
 
 
 def polygon_parts(geometry):
@@ -67,8 +73,9 @@ def finalise_district_table(gdf, method: str = "equal"):
     gdf["pop_dens"] = gdf["pop_total"] / area
     for fraction, pct in (("crop_frac", "crop_pct"), ("urban_frac", "urban_pct")):
         gdf[pct] = 100 * gdf[fraction] if fraction in gdf else float("nan")
-    if "infra" not in gdf:
-        gdf["infra"] = float("nan")
+    for column in ["infra"] + VULNERABILITY_FIELDS:  # optional layers may be missing
+        if column not in gdf:
+            gdf[column] = float("nan")
     gdf["fl_hi_pct"] = 100 * gdf["fl_hi_frac"]
     gdf["dr_hi_pct"] = 100 * gdf["dr_hi_frac"]
     for prefix in ("fl", "dr", "mh"):
@@ -440,45 +447,151 @@ def export_geotiffs(ee, rasters: dict, prefix: str, folder: str, region, scale: 
 GEOTIFF_NODATA = -9999  # index/value layers; class layers use 0 (classes are 1-5)
 
 
+def _http_fetch(url):
+    """GET ``url``; on an HTTP error, raise with Earth Engine's own error message."""
+    import requests
+
+    response = requests.get(url, timeout=600)
+    if response.status_code >= 400:
+        try:
+            detail = response.json()["error"]["message"]
+        except Exception:
+            detail = response.text[:200]
+        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+    return response.content
+
+
+def _prepare_geotiff(ee, name, image):
+    is_class = name.endswith("_class")
+    nodata = 0 if is_class else GEOTIFF_NODATA
+    image = ee.Image(image).unmask(nodata)
+    return (image.toByte() if is_class else image.toFloat()), nodata
+
+
+def _download(image, path: Path, name: str, prefix: str, region, scale, fetch) -> None:
+    url = image.getDownloadURL({"name": f"{prefix}_{name}", "region": region, "scale": scale,
+                                "crs": "EPSG:4326", "format": "GEO_TIFF"})
+    path.write_bytes(fetch(url))
+
+
 def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, scale: int = 1000,
-                      fetch=None, log=print) -> list:
-    """Download each raster as a GeoTIFF straight into ``out_dir`` (no Drive export needed).
+                      fetch=None, log=print, asset_folder: str | None = None, wait_minutes: float = 90,
+                      poll_seconds: float = 20, sleep=None) -> list:
+    """Save each raster as a GeoTIFF in ``out_dir`` (no Drive export needed).
 
-    Earth Engine's direct download is limited to about 32 MB per file, which a
-    country at 1 km easily fits (Kenya is ~5 MB per Float32 layer). A layer that is
-    too large, or fails for any other reason, is reported and skipped; raise
-    ``EXPORT_SCALE`` or use the Drive export for it. Masked pixels are written as
-    ``GEOTIFF_NODATA`` (0 for class layers) and tagged as nodata when rasterio is
-    available.
+    Every layer is first requested as a direct download. Heavy layers (long time
+    series, road density) can exceed the interactive time or memory limit (HTTP 503
+    or 400). With ``asset_folder`` (e.g. ``projects/<EE_PROJECT>/assets/safe4all_exports``)
+    those layers are then computed as Earth Engine batch tasks, which have much
+    higher limits, into a temporary asset; the finished asset is downloaded and
+    deleted. Masked pixels are ``GEOTIFF_NODATA`` (0 for class layers).
     """
-    if fetch is None:
-        import requests
-
-        def fetch(url):
-            response = requests.get(url, timeout=600)
-            response.raise_for_status()
-            return response.content
-
+    fetch = fetch or _http_fetch
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
+    saved, failed = [], {}
     for name, image in rasters.items():
-        is_class = name.endswith("_class")
-        nodata = 0 if is_class else GEOTIFF_NODATA
-        image = ee.Image(image).unmask(nodata)
-        image = image.toByte() if is_class else image.toFloat()
+        image, nodata = _prepare_geotiff(ee, name, image)
         path = out_dir / f"{prefix}_{name}.tif"
         try:
-            url = image.getDownloadURL({"name": f"{prefix}_{name}", "region": region, "scale": scale,
-                                        "crs": "EPSG:4326", "format": "GEO_TIFF"})
-            path.write_bytes(fetch(url))
+            _download(image, path, name, prefix, region, scale, fetch)
         except Exception as error:
-            log(f"GeoTIFF skipped: {name} ({str(error)[:150]})")
+            failed[name] = (image, nodata)
+            log(f"Direct download failed: {name} ({str(error)[:200]})")
             continue
         _tag_nodata(path, nodata)
         saved.append(path)
         log(f"Saved GeoTIFF: {path.name}")
+    if failed and asset_folder:
+        saved += _download_via_assets(ee, failed, out_dir, prefix, region, scale, fetch, log,
+                                      asset_folder, wait_minutes, poll_seconds, sleep)
+    elif failed:
+        log(f"Skipped: {sorted(failed)}")
     log(f"{len(saved)} of {len(rasters)} GeoTIFF(s) saved to {out_dir}")
+    return saved
+
+
+def _create_folder(ee, path: str) -> None:
+    try:
+        ee.data.createAsset({"type": "FOLDER"}, path)
+    except Exception as error:
+        if "exist" not in str(error).lower():
+            raise
+
+
+def _download_via_assets(ee, failed: dict, out_dir: Path, prefix: str, region, scale, fetch, log,
+                         asset_folder: str, wait_minutes: float, poll_seconds: float, sleep) -> list:
+    """Compute layers as batch tasks into temporary assets, then download and delete them."""
+    import datetime
+    import time
+    import uuid
+
+    sleep = sleep or time.sleep
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run = f"{asset_folder.rstrip('/')}/{prefix}_{stamp}_{uuid.uuid4().hex[:6]}"  # unique per participant run
+    try:
+        _create_folder(ee, asset_folder.rstrip("/"))
+        _create_folder(ee, run)
+    except Exception as error:
+        log(f"Could not create the Earth Engine asset folder {run} ({str(error)[:200]}); skipped: {sorted(failed)}")
+        return []
+
+    tasks = {}
+    for name, (image, _) in failed.items():
+        try:
+            task = ee.batch.Export.image.toAsset(
+                image=image, description=f"{prefix}_{name}"[:100], assetId=f"{run}/{name}", region=region,
+                scale=scale, crs="EPSG:4326", maxPixels=1e13, pyramidingPolicy={".default": "sample"})
+            task.start()
+            tasks[name] = task
+        except Exception as error:
+            log(f"GeoTIFF skipped: {name} (batch export could not start: {str(error)[:200]})")
+    log(f"Computing {len(tasks)} layer(s) as Earth Engine batch tasks (up to {wait_minutes:g} min; "
+        "slower while the project is in restricted mode)...")
+
+    states, deadline = {}, time.time() + wait_minutes * 60
+    while tasks:
+        for name, task in tasks.items():
+            if states.get(name) not in ("COMPLETED", "FAILED", "CANCELLED"):
+                try:
+                    status = task.status()
+                except Exception as error:  # transient API error: try again next round
+                    status = {"state": states.get(name, "UNKNOWN"), "error_message": str(error)[:100]}
+                if status.get("state") != states.get(name):
+                    log(f"  {name}: {status.get('state')} {status.get('error_message', '')}".rstrip())
+                states[name] = status.get("state")
+        if all(state in ("COMPLETED", "FAILED", "CANCELLED") for state in states.values()):
+            break
+        if time.time() > deadline:
+            log(f"Stopped waiting after {wait_minutes:g} min. Still running: "
+                f"{[n for n, s in states.items() if s not in ('COMPLETED', 'FAILED', 'CANCELLED')]}. "
+                f"They will finish in {run}; re-run this cell later to retry.")
+            break
+        sleep(poll_seconds)
+
+    saved = []
+    for name, state in states.items():
+        if state != "COMPLETED":
+            continue
+        asset_id = f"{run}/{name}"
+        path = out_dir / f"{prefix}_{name}.tif"
+        try:
+            _download(ee.Image(asset_id), path, name, prefix, region, scale, fetch)
+        except Exception as error:
+            log(f"GeoTIFF skipped: {name} (download of the finished asset failed: {str(error)[:200]})")
+            continue
+        _tag_nodata(path, failed[name][1])
+        saved.append(path)
+        log(f"Saved GeoTIFF: {path.name}")
+        try:
+            ee.data.deleteAsset(asset_id)
+        except Exception:
+            pass
+    if all(state in ("COMPLETED", "FAILED", "CANCELLED") for state in states.values()):
+        try:
+            ee.data.deleteAsset(run)  # only empty folders can be deleted; leftovers are kept
+        except Exception:
+            pass
     return saved
 
 
@@ -488,11 +601,18 @@ def _tag_nodata(path: Path, nodata) -> None:
         import rasterio
     except ImportError:
         return
+    import logging
+
+    logger = logging.getLogger("rasterio._env")
+    level = logger.level
+    logger.setLevel(logging.ERROR)  # hides a harmless "legacy Deflate codec" warning
     try:
         with rasterio.open(path, "r+") as dataset:
             dataset.nodata = nodata
     except Exception:
         pass
+    finally:
+        logger.setLevel(level)
 
 
 def export_tables(ee, collection, prefix: str, folder: str, formats=("CSV", "SHP")) -> list:

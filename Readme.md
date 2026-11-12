@@ -67,19 +67,24 @@ and land-use susceptibility scores are in `safe4all/config.py`.
 
 - **GeoTIFFs** (`outputs/<study area>/geotiff/`, `SAVE_GEOTIFFS = True`):
   hazard, exposure, vulnerability, risk index and risk class for flood,
-  drought and multi-hazard, Sentinel-1 flood frequency, and the separate
-  exposure layers (population per km2, cropland and settlement cover
-  fractions, infrastructure index). Downloaded directly from Earth Engine,
-  so they are also in the zip. Each file must stay under Earth Engine's
-  ~32 MB download limit (a whole country at 1 km fits easily); a layer that
-  is too large is skipped with a message, so raise `EXPORT_SCALE` for it.
+  drought and multi-hazard, hazard classes, Sentinel-1 flood frequency, the
+  separate exposure layers (population per km2, cropland and settlement cover
+  fractions, infrastructure index) and the vulnerability components
+  (socioeconomic and its indicators, flood and drought land use,
+  agricultural dependence). They are also in the zip. Each layer is first
+  downloaded directly; layers too heavy for that (long time series, road
+  density) are computed as Earth Engine batch tasks into temporary assets in
+  `EE_PROJECT` (`safe4all_exports/`), downloaded, then deleted. This needs
+  asset write access on the project for the signed-in account (the workshop
+  service account needs the Earth Engine Resource Writer role).
 - **Google Drive export** (`EXPORT_TO_DRIVE = True`, off by default): the same
   GeoTIFFs plus district statistics as Earth Engine tasks to
   `SAFE4ALL_Flood_Drought_Risk` in the Drive of the signed-in account. With
   the workshop service-account key that is the service account's own Drive,
   which nobody can open, so only use it when signed in with your own account.
 - **Workshop cache** (`outputs/<study area>/`): district risk statistics CSV
-  (with population per km2, cropland %, settlement % and infrastructure index per district),
+  (with population per km2, cropland %, settlement %, infrastructure index and
+  the vulnerability components per district),
   zipped shapefile, interactive district map (self-contained HTML), interactive
   raster map (HTML, including population, cropland, settlement and
   infrastructure layers), area and population per risk class, district ranking
