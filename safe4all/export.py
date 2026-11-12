@@ -101,8 +101,88 @@ def save_shapefile(gdf, out_dir: Path, prefix: str) -> Path:
     return zip_path
 
 
+NO_DATA_LABEL = "No data"
+NO_DATA_COLOR = "bdbdbd"
+
+# Leaflet snippet that turns a set of overlay layers into "pick one" layers: ticking
+# one in the layer control hides the others, so class maps are never stacked.
+_EXCLUSIVE_LAYERS_JS = """
+(function () {
+    var map = %(map)s;
+    var group = [%(layers)s];
+    map.on('overlayadd', function (event) {
+        if (group.indexOf(event.layer) === -1) { return; }
+        // Deferred: while the layer control handles a click it re-adds every ticked
+        // layer; removing afterwards also refreshes the checkboxes.
+        setTimeout(function () {
+            group.forEach(function (layer) {
+                if (layer !== event.layer && map.hasLayer(layer)) { map.removeLayer(layer); }
+            });
+        }, 0);
+    });
+})();
+"""
+
+
+def _add_script(fmap, code: str) -> None:
+    """Attach JavaScript that runs after the map and its layers are created.
+
+    Scripts added to the page root run before folium defines the map variable,
+    so they are added as a child of the map instead (rendered in order).
+    """
+    from branca.element import MacroElement
+    from jinja2 import Template
+
+    element = MacroElement()
+    element._template = Template("{% macro script(this, kwargs) %}" + code + "{% endmacro %}")
+    fmap.add_child(element)
+
+
+def _make_exclusive(fmap, layers) -> None:
+    """Show at most one of ``layers`` at a time (radio-like overlays in the layer control)."""
+    script = _EXCLUSIVE_LAYERS_JS % {"map": fmap.get_name(), "layers": ", ".join(l.get_name() for l in layers)}
+    _add_script(fmap, script)
+
+
+def _legend_html(title: str, labels, colours, note: str = "") -> str:
+    rows = "".join(
+        f'<div style="display:flex;align-items:center;margin:2px 0">'
+        f'<span style="display:inline-block;width:18px;height:12px;margin-right:6px;'
+        f'border:1px solid #777;background:#{colour}"></span>{label}</div>'
+        for label, colour in zip(labels, colours))
+    note_html = f'<div style="margin-top:6px;color:#555;max-width:220px">{note}</div>' if note else ""
+    return (f'<div style="font-weight:bold;margin-bottom:4px">{title}</div>{rows}{note_html}')
+
+
+def _add_box(fmap, html: str, position: str = "bottomright") -> None:
+    """Add a fixed HTML box (legend / note) as a Leaflet control."""
+    import json
+
+    script = f"""
+    (function () {{
+        var box = L.control({{position: '{position}'}});
+        box.onAdd = function () {{
+            var div = L.DomUtil.create('div', 'safe4all-box');
+            div.style.cssText = 'background:rgba(255,255,255,0.92);padding:8px 10px;border-radius:4px;'
+                + 'box-shadow:0 1px 4px rgba(0,0,0,0.3);font:12px/1.4 Arial,sans-serif;color:#222';
+            div.innerHTML = {json.dumps(html)};
+            L.DomEvent.disableClickPropagation(div);
+            L.DomEvent.disableScrollPropagation(div);
+            return div;
+        }};
+        box.addTo({fmap.get_name()});
+    }})();
+    """
+    _add_script(fmap, script)
+
+
 def save_district_html(gdf, path: Path) -> Path:
-    """Self-contained interactive district map (flood / drought / multi-hazard layers, pop-ups)."""
+    """Self-contained interactive district map (flood / drought / multi-hazard layers, pop-ups).
+
+    Works offline apart from the basemap and the Leaflet scripts: all district
+    polygons and statistics are embedded in the file. Districts without a risk
+    value (e.g. fully masked as water/urban) are drawn grey as "No data".
+    """
     import folium
 
     fields = ["ADM1_NAME", "ADM2_NAME", "pop_total", "fl_risk", "fl_class", "pop_fl_hi",
@@ -112,19 +192,119 @@ def save_district_html(gdf, path: Path) -> Path:
                "Pop. in high drought risk", "Multi-hazard index", "Multi-hazard class"]
     data = gdf[gdf.geometry.notna()].copy()
     for column in ("fl_risk", "dr_risk", "mh_risk"):
-        data[column] = data[column].round(3)
+        # Strings, so a missing value reads "No data" in the tooltip instead of "null".
+        data[column] = data[column].apply(lambda v: NO_DATA_LABEL if v is None or v != v else f"{v:.3f}")
     for column in ("pop_total", "pop_fl_hi", "pop_dr_hi"):
-        data[column] = data[column].round(0).astype(int)
-    fmap = None
+        data[column] = data[column].fillna(0).round(0).astype(int)
+    for column in ("fl_class", "dr_class", "mh_class"):
+        data[column] = data[column].fillna(NO_DATA_LABEL)
+
+    categories = CLASS_LABELS + [NO_DATA_LABEL]
+    colours = CLASS_COLORS + [NO_DATA_COLOR]
+    fmap = folium.Map(tiles=None, control_scale=True)
+    folium.TileLayer(BASEMAP_URL, attr=BASEMAP_ATTRIBUTION, name="Esri World Street Map").add_to(fmap)
+    colour_of = {label: "#" + colour for label, colour in zip(categories, colours)}
+    data = data[fields + ["geometry"]]
+    layers = []
     for i, (column, name) in enumerate([("fl_class", "Flood risk"), ("dr_class", "Drought risk"),
                                         ("mh_class", "Multi-hazard risk")]):
-        fmap = data.explore(m=fmap, column=column, categorical=True, categories=CLASS_LABELS,
-                            cmap=["#" + c for c in CLASS_COLORS], name=name, show=(i == 0),
-                            legend=(i == 0), legend_kwds={"caption": "Risk class"},
-                            tooltip=fields, tooltip_kwds={"aliases": aliases}, popup=fields,
-                            style_kwds={"color": "#444444", "weight": 0.6, "fillOpacity": 0.75},
-                            tiles=BASEMAP_URL, attr=BASEMAP_ATTRIBUTION)
+        def style(feature, column=column):
+            fill = colour_of.get(feature["properties"][column], colour_of[NO_DATA_LABEL])
+            return {"fillColor": fill, "color": "#444444", "weight": 0.6, "fillOpacity": 0.75}
+
+        layer = folium.GeoJson(
+            data, name=name, show=(i == 0), style_function=style,
+            highlight_function=lambda _: {"weight": 2.5, "color": "#000000", "fillOpacity": 0.85},
+            tooltip=folium.GeoJsonTooltip(fields, aliases=aliases, sticky=True),
+            popup=folium.GeoJsonPopup(fields, aliases=aliases),
+        )
+        layer.add_to(fmap)
+        layers.append(layer)
+    minx, miny, maxx, maxy = data.total_bounds
+    fmap.fit_bounds([[miny, minx], [maxy, maxx]])
+    _add_box(fmap, _legend_html("Risk class (district mean)", categories, colours,
+                                "Tick one layer at a time in the top-right box: flood, drought or multi-hazard."))
     folium.LayerControl(collapsed=False).add_to(fmap)
+    _make_exclusive(fmap, layers)
+    fmap.save(str(path))
+    return Path(path)
+
+
+def ee_tile_url(image, vis: dict) -> str:
+    """XYZ tile URL for an Earth Engine image (valid only for a limited time, typically hours)."""
+    return image.getMapId(vis)["tile_fetcher"].url_format
+
+
+def save_raster_html(ee, layers, gdf, path: Path, title: str, study_gdf=None,
+                     class_legend: bool = True, index_legend: bool = True) -> Path:
+    """Standalone interactive raster map: Earth Engine tile layers plus vector district outlines.
+
+    ``layers`` is a list of ``(image, vis, name, shown)``; the last shown layer is on
+    top. Unlike ``geemap.Map.to_html`` this does not embed Jupyter widget state, so
+    it opens in any browser without Jupyter, holds only this map, and its legend
+    renders. Earth Engine tile URLs expire (typically after a few hours to a day);
+    district and study-area outlines are embedded as vectors and never expire.
+    Re-run the notebook to refresh the raster layers.
+    """
+    import datetime
+    import html
+
+    import folium
+    from folium.plugins import Fullscreen
+
+    fmap = folium.Map(tiles=None, control_scale=True)
+    folium.TileLayer(BASEMAP_URL, attr=BASEMAP_ATTRIBUTION, name="Esri World Street Map").add_to(fmap)
+    raster_layers = []
+    for image, vis, name, shown in layers:
+        tile = folium.TileLayer(ee_tile_url(image, vis), attr="Google Earth Engine", name=name,
+                                overlay=True, control=True, show=bool(shown), opacity=0.85, max_zoom=18)
+        tile.add_to(fmap)
+        raster_layers.append(tile)
+
+    outlines = gdf[gdf.geometry.notna()].copy()
+    tooltip_fields = [f for f in ("ADM1_NAME", "ADM2_NAME", "fl_class", "dr_class", "mh_class") if f in outlines]
+    tooltip_alias = {"ADM1_NAME": "Region", "ADM2_NAME": "District", "fl_class": "Flood risk (district)",
+                     "dr_class": "Drought risk (district)", "mh_class": "Multi-hazard risk (district)"}
+    keep = tooltip_fields + ["geometry"]
+    outlines = outlines[keep]
+    for field in tooltip_fields:
+        outlines[field] = outlines[field].fillna(NO_DATA_LABEL).astype(str)
+    folium.GeoJson(
+        outlines, name="Districts",
+        style_function=lambda _: {"color": "#555555", "weight": 0.7, "fillOpacity": 0, "fill": True},
+        highlight_function=lambda _: {"color": "#000000", "weight": 2},
+        tooltip=folium.GeoJsonTooltip(tooltip_fields, aliases=[tooltip_alias[f] for f in tooltip_fields]),
+    ).add_to(fmap)
+    bounds_source = outlines
+    if study_gdf is not None and len(study_gdf):
+        study = study_gdf[study_gdf.geometry.notna()][["geometry"]]
+        folium.GeoJson(study, name="Study area", interactive=False,
+                       style_function=lambda _: {"color": "#000000", "weight": 2, "fill": False}).add_to(fmap)
+        bounds_source = study
+    minx, miny, maxx, maxy = bounds_source.total_bounds
+    fmap.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    legend = ""
+    if class_legend:
+        legend += _legend_html("Risk class (class layers)", CLASS_LABELS, CLASS_COLORS)
+    if index_legend:
+        gradient = ",".join("#" + c for c in CLASS_COLORS)
+        legend += ('<div style="font-weight:bold;margin:8px 0 4px">Index layers (0-1)</div>'
+                   f'<div style="width:200px;height:12px;border:1px solid #777;'
+                   f'background:linear-gradient(to right,{gradient})"></div>'
+                   '<div style="display:flex;justify-content:space-between;width:202px">'
+                   '<span>0 low</span><span>0.5</span><span>1 high</span></div>')
+    if legend:
+        _add_box(fmap, legend, "bottomright")
+    created = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    title = html.escape(title)
+    _add_box(fmap, f'<b>{title}</b><br>Raster tiles generated {created}. Earth Engine tiles expire '
+                   'after some hours; if layers stay blank, re-run the notebook export. '
+                   'District outlines always work.', "bottomleft")
+    Fullscreen().add_to(fmap)
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    _make_exclusive(fmap, raster_layers)
+    fmap.get_root().header.add_child(folium.Element(f"<title>{title}</title>"))
     fmap.save(str(path))
     return Path(path)
 

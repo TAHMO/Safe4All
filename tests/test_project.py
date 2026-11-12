@@ -196,9 +196,81 @@ class RiskWorkflowTests(unittest.TestCase):
                 ast.parse("".join(cell["source"]))
                 self.assertEqual(cell["outputs"], [])
 
+    def test_notebook_saves_the_raster_map_without_widget_embedding(self):
+        # geemap's Map.to_html embeds the Jupyter widget state of every map in the
+        # notebook; its anywidget legend/toolbar cannot render outside Jupyter.
+        notebook = json.loads((ROOT / "SAFE4ALL_Climate_Risk_Assessment_Workshop.ipynb").read_text(encoding="utf-8"))
+        code = "\n".join("".join(c["source"]) for c in notebook["cells"] if c["cell_type"] == "code")
+        self.assertNotIn(".to_html(", code)
+        self.assertIn("save_raster_html(", code)
 
-if __name__ == "__main__":
-    unittest.main()
+
+HAS_MAP_LIBS = all(importlib.util.find_spec(name) for name in ("folium", "geopandas", "shapely"))
+
+
+class FakeImage:
+    """Stand-in for an ee.Image: only getMapId is used by the HTML export."""
+
+    def __init__(self, map_id):
+        self.map_id = map_id
+
+    def getMapId(self, vis):
+        fetcher = mock.Mock(url_format=f"https://earthengine.googleapis.com/v1/projects/p/maps/{self.map_id}/tiles/{{z}}/{{x}}/{{y}}")
+        return {"tile_fetcher": fetcher}
+
+
+@unittest.skipUnless(HAS_MAP_LIBS, "folium/geopandas not installed")
+class MapExportTests(unittest.TestCase):
+    def district_gdf(self):
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+
+        def square(x, y):
+            return Polygon([(x, y), (x + 1, y), (x + 1, y + 1), (x, y + 1)])
+
+        return gpd.GeoDataFrame({
+            "ADM1_NAME": ["North", "South"], "ADM2_NAME": ["Alpha", "Beta"],
+            "pop_total": [1000.4, 2000.0], "pop_fl_hi": [10.0, 0.0], "pop_dr_hi": [5.0, 0.0],
+            "fl_risk": [0.91, 0.30], "fl_class": ["Very High", "Low"],
+            "dr_risk": [0.55, float("nan")], "dr_class": ["Moderate", "No data"],
+            "mh_risk": [0.73, float("nan")], "mh_class": ["High", "No data"],
+        }, geometry=[square(-2, 6), square(-1, 7)], crs="EPSG:4326")
+
+    def test_district_map_shows_no_data_and_one_layer_at_a_time(self):
+        from safe4all.export import NO_DATA_COLOR, save_district_html
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            html = save_district_html(self.district_gdf(), Path(tmp_dir) / "d.html").read_text(encoding="utf-8")
+        self.assertIn("No data", html)
+        self.assertIn("#" + NO_DATA_COLOR, html)
+        self.assertNotIn('"dr_risk": null', html)
+        self.assertIn("overlayadd", html)
+        # Custom scripts must run after folium creates the map, or the page breaks.
+        self.assertLess(html.index("= L.map("), html.index("overlayadd"))
+        self.assertLess(html.index("= L.map("), html.index("L.control({position"))
+        for name in ("Flood risk", "Drought risk", "Multi-hazard risk"):
+            self.assertIn(f'"{name}"', html)
+        self.assertEqual(html.count("L.control.layers("), 1)
+
+    def test_raster_map_is_plain_leaflet_with_ee_tiles_and_vector_outlines(self):
+        from safe4all.export import save_raster_html
+
+        layers = [(FakeImage("flood-index"), {"min": 0, "max": 1}, "Flood risk index", False),
+                  (FakeImage("flood-class"), {"min": 1, "max": 5}, "Flood risk class", True)]
+        gdf = self.district_gdf()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            html = save_raster_html(None, layers, gdf, Path(tmp_dir) / "r.html", title="Risk <Ghana>",
+                                    study_gdf=gdf.dissolve()).read_text(encoding="utf-8")
+        self.assertNotIn("widget-state", html)
+        self.assertNotIn("anywidget", html)
+        self.assertIn("maps/flood-index/tiles/{z}/{x}/{y}", html)
+        self.assertIn("maps/flood-class/tiles/{z}/{x}/{y}", html)
+        self.assertIn('"Districts"', html)
+        self.assertIn('"Study area"', html)
+        self.assertIn("Alpha", html)
+        self.assertIn("Very High", html)
+        self.assertIn("Risk &lt;Ghana&gt;", html)
+        self.assertEqual(html.count("L.control.layers("), 1)
 
 
 if __name__ == "__main__":
