@@ -40,15 +40,29 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
 
 
 def stations(country: str) -> pd.DataFrame:
-    """Fetch station metadata for a workshop country."""
+    """Fetch station metadata for a workshop country.
+
+    Raises ``LookupError`` with what the API did return when no station of the
+    country is found, so an empty list is never silently used (or cached).
+    """
     if country not in COUNTRY_CODES:
         raise ValueError(f"Unsupported country: {country}")
     payload = _get("services/assets/v2/stations", {"sort": "code"})
-    frame = pd.json_normalize(payload["data"])
-    return frame.loc[
-        frame["location.countrycode"].eq(COUNTRY_CODES[country])
-        & ~frame["code"].astype(str).str.contains("TH", na=False)
-    ].copy()
+    frame = pd.json_normalize(payload.get("data") or [])
+    if frame.empty or "location.countrycode" not in frame:
+        raise LookupError(
+            f"The TAHMO API returned no station list for this account (response keys: {sorted(payload)})."
+        )
+    in_country = frame["location.countrycode"].eq(COUNTRY_CODES[country])
+    selected = frame.loc[in_country & ~frame["code"].astype(str).str.contains("TH", na=False)].copy()
+    if selected.empty:
+        seen = frame["location.countrycode"].value_counts().to_dict()
+        raise LookupError(
+            f"The TAHMO API returned {len(frame)} stations but none usable in {country} "
+            f"({COUNTRY_CODES[country]}; {int(in_country.sum())} before excluding 'TH' codes). "
+            f"Stations per country code: {seen}"
+        )
+    return selected
 
 
 def station_precipitation(station_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -74,6 +88,30 @@ def station_precipitation(station_code: str, start_date: str, end_date: str) -> 
 
 def save_station_metadata(path: Path, country: str) -> None:
     stations(country).to_csv(path, index=False)
+
+
+def load_station_metadata(path: Path, country: str, log=print) -> pd.DataFrame:
+    """Return the country's station list, from the cache file if it has stations.
+
+    An empty cached list (saved by an older version) is deleted and fetched
+    again; a fresh list is only cached when it contains stations.
+    """
+    path = Path(path)
+    if path.is_file():
+        try:
+            frame = pd.read_csv(path)
+        except (pd.errors.EmptyDataError, pd.errors.ParserError):
+            frame = pd.DataFrame()
+        if not frame.empty and "code" in frame:
+            log(f"Cache hit: {path} ({len(frame)} stations)")
+            return frame
+        path.unlink()
+        log(f"Removed an empty cached station list: {path}")
+    frame = stations(country)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    log(f"Cached {len(frame)} {country} stations: {path}")
+    return frame
 
 
 def _skip_reason(error: Exception) -> str:

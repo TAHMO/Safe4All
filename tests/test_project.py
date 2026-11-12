@@ -147,6 +147,32 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(sorted(observations["station"].unique()), ["A", "B", "OLD"])
         self.assertEqual(cached, ["A_precip.csv", "B_precip.csv", "OLD_precip.csv"])
 
+    @unittest.skipUnless(importlib.util.find_spec("pandas") and importlib.util.find_spec("requests"),
+                         "pandas/requests not installed")
+    def test_tahmo_station_list_is_never_cached_empty(self):
+        # An empty cached station list (saved by an older version) made every
+        # later run try 0 stations. It must be refetched, and an API answer
+        # with no stations for the country must raise, not be cached.
+        from safe4all import tahmo
+
+        api = {"data": [
+            {"code": "TA00001", "location": {"countrycode": "KE", "latitude": 0.1, "longitude": 37.0}},
+            {"code": "TA00002", "location": {"countrycode": "GH", "latitude": 9.4, "longitude": -0.8}},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "tahmo" / "Kenya" / "station_metadata.csv"
+            path.parent.mkdir(parents=True)
+            path.write_text("code,location.latitude,location.longitude\n")  # stale empty list
+            with mock.patch.object(tahmo, "_get", return_value=api):
+                kenya = tahmo.load_station_metadata(path, "Kenya", log=lambda *_: None)
+                self.assertEqual(kenya["code"].tolist(), ["TA00001"])
+                self.assertIn("TA00001", path.read_text())
+
+                zim_path = Path(tmp_dir) / "zim.csv"
+                with self.assertRaisesRegex(LookupError, "none usable in Zimbabwe.*'KE': 1"):
+                    tahmo.load_station_metadata(zim_path, "Zimbabwe", log=lambda *_: None)
+                self.assertFalse(zim_path.exists())
+
     def test_earth_engine_service_account_key_must_exist(self):
         env = {"EE_PROJECT": "some-project", "EE_SERVICE_ACCOUNT_KEY": "/no/such/key.json"}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, {"ee": mock.MagicMock()}):
