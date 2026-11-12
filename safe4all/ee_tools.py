@@ -29,14 +29,46 @@ def month_filter(ee, months):
     return ee.Filter.Or(*[ee.Filter.calendarRange(int(m), int(m), "month") for m in months])
 
 
+# Compute region statistics (percentiles for rescaling, quantile class breaks) once
+# and embed them as constants. Otherwise every map tile, export and district
+# statistic re-runs the whole-region reduction, and these reductions are nested
+# (risk = minmax(hazard x exposure x vulnerability), each built from minmax layers).
+# The numbers are identical; set False to go back to fully lazy evaluation.
+PRECOMPUTE_STATS = True
+
+
+def resolve_stats(ee, image, stats, suffixes, label: str = ""):
+    """Fetch the first band's ``<band><suffix>`` statistics as Python floats in one request.
+
+    Returns None (caller keeps the lazy server-side expression) if precomputing is
+    off, the request fails (e.g. an interactive time-out), or any value is missing.
+    """
+    if not PRECOMPUTE_STATS:
+        return None
+    try:
+        result = ee.Dictionary({"band": image.bandNames().get(0), "stats": stats}).getInfo() or {}
+    except Exception as error:
+        print(f"  {label or 'statistics'}: computed lazily ({str(error)[:100]})")
+        return None
+    values = result.get("stats") or {}
+    numbers = [values.get(f"{result.get('band')}{suffix}") for suffix in suffixes]
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or v != v for v in numbers):
+        return None
+    return [float(v) for v in numbers]
+
+
 def minmax(ee, image, region, scale, name, pmin=2, pmax=98):
     """Rescale an indicator to 0-1 using its 2nd-98th percentile over the region."""
     image = ee.Image(image)
-    band = ee.String(image.bandNames().get(0))
     stats = image.reduceRegion(reducer=ee.Reducer.percentile([pmin, pmax]), geometry=region,
                                scale=scale, bestEffort=True, maxPixels=1e13, tileScale=4)
-    low = ee.Number(stats.get(band.cat(f"_p{pmin}")))
-    high = ee.Number(stats.get(band.cat(f"_p{pmax}")))
+    resolved = resolve_stats(ee, image, stats, [f"_p{pmin}", f"_p{pmax}"], name)
+    if resolved:
+        low, high = (ee.Number(v) for v in resolved)
+    else:
+        band = ee.String(image.bandNames().get(0))
+        low = ee.Number(stats.get(band.cat(f"_p{pmin}")))
+        high = ee.Number(stats.get(band.cat(f"_p{pmax}")))
     return image.subtract(low).divide(high.subtract(low).max(1e-9)).clamp(0, 1).rename(name).clip(region)
 
 
@@ -119,9 +151,13 @@ def class_breaks(ee, image, region, scale, method: str = "equal"):
         return list(EQUAL_BREAKS)
     if method != "quantile":
         raise ValueError("CLASS_METHOD must be 'equal' or 'quantile'.")
-    band = ee.String(ee.Image(image).bandNames().get(0))
-    stats = ee.Image(image).reduceRegion(ee.Reducer.percentile([20, 40, 60, 80]), region, scale,
-                                         bestEffort=True, maxPixels=1e13, tileScale=4)
+    image = ee.Image(image)
+    stats = image.reduceRegion(ee.Reducer.percentile([20, 40, 60, 80]), region, scale,
+                               bestEffort=True, maxPixels=1e13, tileScale=4)
+    resolved = resolve_stats(ee, image, stats, [f"_p{q}" for q in (20, 40, 60, 80)], "class breaks")
+    if resolved:
+        return [ee.Number(v) for v in resolved]
+    band = ee.String(image.bandNames().get(0))
     return [ee.Number(stats.get(band.cat(f"_p{q}"))) for q in (20, 40, 60, 80)]
 
 

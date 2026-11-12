@@ -1,6 +1,9 @@
 import ast
+import contextlib
 import importlib.util
+import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -221,6 +224,54 @@ class RiskWorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             aoi_label("Ghana", "watershed")
 
+    def test_region_statistics_are_fetched_once_or_left_lazy(self):
+        from safe4all import ee_tools
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self, _):
+                return "band"
+
+        class FakeEE:
+            calls = 0
+            fail = False
+
+            def Dictionary(self, mapping):
+                outer = self
+
+                class Request:
+                    def getInfo(self):
+                        outer.calls += 1
+                        if outer.fail:
+                            raise RuntimeError("Computation timed out.")
+                        return {"band": "band", "stats": mapping["stats"]}
+                return Request()
+
+        class Image:
+            def bandNames(self):
+                return Value(None)
+
+        ee = FakeEE()
+        stats = {"band_p2": 1, "band_p98": 9.5}
+        self.assertEqual(ee_tools.resolve_stats(ee, Image(), stats, ["_p2", "_p98"]), [1.0, 9.5])
+        self.assertEqual(ee.calls, 1)  # band name and both percentiles in one request
+        # Empty region (null percentile) or a failed request: keep the lazy expression.
+        self.assertIsNone(ee_tools.resolve_stats(ee, Image(), {"band_p2": None, "band_p98": 3}, ["_p2", "_p98"]))
+        ee.fail = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(ee_tools.resolve_stats(ee, Image(), stats, ["_p2", "_p98"]))
+        ee.fail = False
+        original = ee_tools.PRECOMPUTE_STATS
+        try:
+            ee_tools.PRECOMPUTE_STATS = False
+            calls = ee.calls
+            self.assertIsNone(ee_tools.resolve_stats(ee, Image(), stats, ["_p2", "_p98"]))
+            self.assertEqual(ee.calls, calls)
+        finally:
+            ee_tools.PRECOMPUTE_STATS = original
+
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]
         self.assertEqual(assign_classes(values), ["Very Low", "Very High", "No data", "Moderate", "Moderate"])
@@ -293,6 +344,24 @@ class MapExportTests(unittest.TestCase):
             "dr_risk": [0.55, float("nan")], "dr_class": ["Moderate", "No data"],
             "mh_risk": [0.73, float("nan")], "mh_class": ["High", "No data"],
         }, geometry=[square(-2, 6), square(-1, 7)], crs="EPSG:4326")
+
+    def test_district_table_reports_separate_exposure_layers(self):
+        from safe4all.export import finalise_district_table
+
+        gdf = self.district_gdf()
+        for field, values in {"ADM0_NAME": ["Ghana", "Ghana"], "ADM2_CODE": [1, 2], "area_km2": [10.0, 0.0],
+                              "fl_haz": [0.5, 0.2], "fl_exp": [0.4, 0.3], "fl_vul": [0.3, 0.2],
+                              "dr_haz": [0.5, 0.2], "dr_exp": [0.4, 0.3], "dr_vul": [0.3, 0.2],
+                              "crop_frac": [0.25, 0.5], "urban_frac": [0.1, 0.0], "infra": [0.33333, 0.1]}.items():
+            gdf[field] = values
+        _, table = finalise_district_table(gdf)
+        row = table.set_index("district").loc["Alpha"]
+        self.assertAlmostEqual(row["population_per_km2"], 100.0)
+        self.assertAlmostEqual(row["cropland_cover_pct"], 25.0)
+        self.assertAlmostEqual(row["settlement_cover_pct"], 10.0)
+        self.assertAlmostEqual(row["infrastructure_index_mean"], 0.333)
+        # A zero-area district has no density rather than a division error.
+        self.assertTrue(math.isnan(table.set_index("district").loc["Beta", "population_per_km2"]))
 
     def test_district_map_shows_no_data_and_one_layer_at_a_time(self):
         from safe4all.export import NO_DATA_COLOR, save_district_html

@@ -67,10 +67,14 @@ and land-use susceptibility scores are in `safe4all/config.py`.
 
 - **Google Drive** (`SAFE4ALL_Flood_Drought_Risk`): GeoTIFFs of hazard,
   exposure, vulnerability, risk index and risk class for flood, drought and
-  multi-hazard, plus the district statistics as CSV and Shapefile.
-- **Workshop cache** (`outputs/<study area>/`): district risk statistics CSV,
+  multi-hazard, the separate exposure layers (population per km2, cropland
+  and settlement cover fractions, infrastructure index), plus the district
+  statistics as CSV and Shapefile.
+- **Workshop cache** (`outputs/<study area>/`): district risk statistics CSV
+  (with population per km2, cropland %, settlement % and infrastructure index per district),
   zipped shapefile, interactive district map (self-contained HTML), interactive
-  raster map (HTML), area and population per risk class, district ranking
+  raster map (HTML, including population, cropland, settlement and
+  infrastructure layers), area and population per risk class, district ranking
   chart and static risk maps (PNG), and one zip of everything.
 
 ## Data strategy

@@ -40,8 +40,9 @@ def class_area_population(ee, class_image, population, region, scale: int = 1000
     # No scale: the population grid's own projection is used, so totals are exact.
     people = (population.addBands(class_image)
               .reduceRegion(grouped, region, maxPixels=1e13, tileScale=4).get("groups"))
-    area_by = {int(g["cls"]): g["sum"] for g in ee.List(area).getInfo()}
-    people_by = {int(g["cls"]): g["sum"] for g in ee.List(people).getInfo()}
+    groups = ee.Dictionary({"area": area, "people": people}).getInfo()  # one round trip, not two
+    area_by = {int(g["cls"]): g["sum"] for g in groups["area"]}
+    people_by = {int(g["cls"]): g["sum"] for g in groups["people"]}
     total_area, total_people = sum(area_by.values()) or 1, sum(people_by.values()) or 1
     return [{"class": label, "area_km2": area_by.get(i, 0.0), "area_pct": 100 * area_by.get(i, 0.0) / total_area,
              "population": people_by.get(i, 0.0), "population_pct": 100 * people_by.get(i, 0.0) / total_people}

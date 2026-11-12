@@ -14,7 +14,8 @@ from .model import assign_classes, rank_descending
 # Short shapefile field (<= 10 characters) -> descriptive CSV column.
 FIELD_DESCRIPTIONS = {
     "ADM0_NAME": "country", "ADM1_NAME": "region", "ADM2_NAME": "district", "ADM2_CODE": "district_code",
-    "area_km2": "area_km2", "pop_total": "population",
+    "area_km2": "area_km2", "pop_total": "population", "pop_dens": "population_per_km2",
+    "crop_pct": "cropland_cover_pct", "urban_pct": "settlement_cover_pct", "infra": "infrastructure_index_mean",
     "fl_haz": "flood_hazard_mean", "fl_exp": "flood_exposure_mean", "fl_vul": "flood_vulnerability_mean",
     "fl_risk": "flood_risk_index", "fl_class": "flood_risk_class", "fl_rank": "flood_risk_rank",
     "fl_hi_pct": "flood_high_veryhigh_area_pct", "pop_fl_hi": "flood_high_veryhigh_population",
@@ -62,6 +63,12 @@ def finalise_district_table(gdf, method: str = "equal"):
               f"{gdf.loc[missing, 'ADM2_NAME'].tolist()}")
     for column in ["pop_total", "pop_fl_hi", "pop_dr_hi", "fl_hi_frac", "dr_hi_frac"]:
         gdf[column] = gdf[column].fillna(0) if column in gdf else 0.0
+    area = gdf["area_km2"].where(gdf["area_km2"] > 0) if "area_km2" in gdf else float("nan")
+    gdf["pop_dens"] = gdf["pop_total"] / area
+    for fraction, pct in (("crop_frac", "crop_pct"), ("urban_frac", "urban_pct")):
+        gdf[pct] = 100 * gdf[fraction] if fraction in gdf else float("nan")
+    if "infra" not in gdf:
+        gdf["infra"] = float("nan")
     gdf["fl_hi_pct"] = 100 * gdf["fl_hi_frac"]
     gdf["dr_hi_pct"] = 100 * gdf["dr_hi_frac"]
     for prefix in ("fl", "dr", "mh"):
@@ -74,7 +81,7 @@ def finalise_district_table(gdf, method: str = "equal"):
     for column in table.columns:
         if column.endswith(("_mean", "_index")):
             table[column] = table[column].round(3)
-        elif column.endswith("_pct") or column == "area_km2":
+        elif column.endswith("_pct") or column in ("area_km2", "population_per_km2"):
             table[column] = table[column].round(1)
         elif column == "population" or column.endswith("_population"):
             table[column] = table[column].round(0).astype(int)
@@ -230,13 +237,21 @@ def save_district_html(gdf, path: Path) -> Path:
     return Path(path)
 
 
+def gradient_legend(title: str, colours, low: str, high: str) -> str:
+    """HTML for a continuous colour-bar legend (``extra_legend`` of :func:`save_raster_html`)."""
+    gradient = ",".join("#" + c.lstrip("#") for c in colours)
+    return (f'<div style="font-weight:bold;margin:8px 0 4px">{title}</div>'
+            f'<div style="width:200px;height:12px;border:1px solid #777;background:linear-gradient(to right,{gradient})"></div>'
+            f'<div style="display:flex;justify-content:space-between;width:202px"><span>{low}</span><span>{high}</span></div>')
+
+
 def ee_tile_url(image, vis: dict) -> str:
     """XYZ tile URL for an Earth Engine image (valid only for a limited time, typically hours)."""
     return image.getMapId(vis)["tile_fetcher"].url_format
 
 
 def save_raster_html(ee, layers, gdf, path: Path, title: str, study_gdf=None,
-                     class_legend: bool = True, index_legend: bool = True) -> Path:
+                     class_legend: bool = True, index_legend: bool = True, extra_legend: str = "") -> Path:
     """Standalone interactive raster map: Earth Engine tile layers plus vector district outlines.
 
     ``layers`` is a list of ``(image, vis, name, shown)``; the last shown layer is on
@@ -294,6 +309,7 @@ def save_raster_html(ee, layers, gdf, path: Path, title: str, study_gdf=None,
                    f'background:linear-gradient(to right,{gradient})"></div>'
                    '<div style="display:flex;justify-content:space-between;width:202px">'
                    '<span>0 low</span><span>0.5</span><span>1 high</span></div>')
+    legend += extra_legend
     if legend:
         _add_box(fmap, legend, "bottomright")
     created = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
