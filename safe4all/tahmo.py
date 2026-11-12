@@ -74,3 +74,65 @@ def station_precipitation(station_code: str, start_date: str, end_date: str) -> 
 
 def save_station_metadata(path: Path, country: str) -> None:
     stations(country).to_csv(path, index=False)
+
+
+def _skip_reason(error: Exception) -> str:
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status in (401, 403):
+        return "no access for this API account"
+    if status == 404:
+        return "station not found"
+    return str(error) or type(error).__name__
+
+
+def collect_station_rainfall(station_codes, start_date: str, end_date: str, max_stations: int,
+                             cache_dir: Path | None = None, fetch=None, log=print):
+    """Fetch rainfall for up to ``max_stations`` stations that actually return data.
+
+    Stations are tried in order until ``max_stations`` of them return
+    observations for the period, so stations the API account cannot access, or
+    that have no data in the period, do not use up the station budget. Only
+    non-empty results are cached in ``cache_dir`` (an empty or unreadable
+    cached file is removed and fetched again).
+
+    Returns ``(observations, used_codes, skipped)`` where ``skipped`` maps a
+    station code to the reason it was not used.
+    """
+    fetch = fetch or station_precipitation
+    frames, used, skipped = [], [], {}
+    for code in station_codes:
+        if len(used) >= max_stations:
+            break
+        cache_path = Path(cache_dir) / f"{code}_precip.csv" if cache_dir else None
+        frame = None
+        if cache_path and cache_path.is_file():
+            try:
+                frame = pd.read_csv(cache_path)
+            except (pd.errors.EmptyDataError, pd.errors.ParserError):
+                frame = None
+            if frame is None or frame.empty:
+                cache_path.unlink()  # an empty result cached by an older version
+                frame = None
+        if frame is None:
+            try:
+                frame = fetch(code, start_date, end_date)
+            except Exception as error:
+                skipped[code] = _skip_reason(error)
+                continue
+            if frame.empty:
+                skipped[code] = "no rainfall data in the period"
+                continue
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                frame.to_csv(cache_path, index=False)
+        frames.append(frame)
+        used.append(code)
+    tried = len(used) + len(skipped)
+    log(f"TAHMO: {len(used)} station(s) with data out of {tried} tried "
+        f"(max {max_stations}).")
+    if skipped:
+        reasons = pd.Series(skipped).value_counts()
+        for reason, count in reasons.items():
+            log(f"  skipped {count}: {reason}")
+    observations = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return observations, used, skipped

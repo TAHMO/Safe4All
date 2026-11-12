@@ -115,6 +115,38 @@ class ProjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "TAHMO_API_SECRET"):
                     load_shared_credentials()
 
+    @unittest.skipUnless(importlib.util.find_spec("pandas") and importlib.util.find_spec("requests"),
+                         "pandas/requests not installed")
+    def test_tahmo_skips_inaccessible_stations_until_enough_have_data(self):
+        # Kenya case: the station list includes stations this API account cannot
+        # read; they must not use up MAX_STATIONS, and empty results must not be
+        # cached (an empty file cached by an older version is refetched).
+        import pandas as pd
+        import requests
+        from safe4all.tahmo import collect_station_rainfall
+
+        def fetch(code, start, end):
+            if code.startswith("NO"):
+                error = requests.HTTPError("403 Client Error")
+                error.response = mock.Mock(status_code=403)
+                raise error
+            if code == "EMPTY":
+                return pd.DataFrame()
+            return pd.DataFrame({"time": ["2024-03-01T00:00:00Z"], "value": [1.5], "station": [code]})
+
+        codes = ["NO1", "NO2", "EMPTY", "OLD", "A", "B", "C"]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "OLD_precip.csv").write_text("\n")  # stale empty cache file
+            observations, used, skipped = collect_station_rainfall(
+                codes, "2024-03-01", "2024-05-31", 3, cache_dir=tmp_dir, fetch=fetch, log=lambda *_: None)
+            cached = sorted(p.name for p in Path(tmp_dir).iterdir())
+
+        self.assertEqual(used, ["OLD", "A", "B"])
+        self.assertEqual(skipped, {"NO1": "no access for this API account", "NO2": "no access for this API account",
+                                   "EMPTY": "no rainfall data in the period"})
+        self.assertEqual(sorted(observations["station"].unique()), ["A", "B", "OLD"])
+        self.assertEqual(cached, ["A_precip.csv", "B_precip.csv", "OLD_precip.csv"])
+
     def test_earth_engine_service_account_key_must_exist(self):
         env = {"EE_PROJECT": "some-project", "EE_SERVICE_ACCOUNT_KEY": "/no/such/key.json"}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, {"ee": mock.MagicMock()}):
