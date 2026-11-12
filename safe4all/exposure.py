@@ -46,13 +46,17 @@ def nightlights(ee, year: int = 2023):
 
 def road_density(ee, region, scale: int = 1000):
     """Share of 100 m cells crossed by a GRIP4 road; None if the community asset is unavailable."""
+    roads = ee.FeatureCollection(GRIP4_AFRICA)
     try:
-        roads = ee.FeatureCollection(GRIP4_AFRICA).filterBounds(region)
-        if roads.limit(1).size().getInfo() == 0:
+        if roads.filterBounds(region).limit(1).size().getInfo() == 0:
             return None
     except Exception as error:  # asset missing or not shared with this project
         print(f"GRIP4 roads unavailable ({str(error)[:80]}); infrastructure uses night-time lights only.")
         return None
+    # Paint the unfiltered collection: Earth Engine then reads only the roads in each
+    # tile from the table's spatial index. Painting roads.filterBounds(region) forces
+    # all of a country's roads into one in-memory object, which fails ("Object too
+    # large") for downloads and exports of a whole country.
     painted = ee.Image(0).byte().paint(roads, 1).reproject(crs="EPSG:4326", scale=100)
     return (painted.reduceResolution(ee.Reducer.mean(), maxPixels=1024)
             .reproject(crs="EPSG:4326", scale=scale).rename("road_density").clip(region))
