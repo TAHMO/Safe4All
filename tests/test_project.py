@@ -421,6 +421,26 @@ class RiskWorkflowTests(unittest.TestCase):
                                          fetch=failing("HTTP 429: Too Many Requests")))
         self.assertIn("night-time lights only", out.getvalue())
 
+    @unittest.skipUnless(importlib.util.find_spec("requests"), "requests not installed")
+    def test_busy_project_downloads_are_retried(self):
+        from safe4all.export import _http_fetch
+
+        class Response:
+            def __init__(self, status, content=b""):
+                self.status_code, self.content, self.text = status, content, ""
+
+            def json(self):
+                return {"error": {"message": "Too Many Requests"}}
+
+        replies = [Response(429), Response(429), Response(200, b"tif")]
+        waits = []
+        with mock.patch("requests.get", side_effect=lambda *a, **k: replies.pop(0)):
+            self.assertEqual(_http_fetch("https://ee/x", sleep=waits.append), b"tif")
+        self.assertEqual(waits, [5, 10])
+        with mock.patch("requests.get", return_value=Response(429)):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                _http_fetch("https://ee/x", retries=2, sleep=lambda _: None)
+
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]
         self.assertEqual(assign_classes(values), ["Very Low", "Very High", "No data", "Moderate", "Moderate"])

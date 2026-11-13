@@ -447,11 +447,22 @@ def export_geotiffs(ee, rasters: dict, prefix: str, folder: str, region, scale: 
 GEOTIFF_NODATA = -9999  # index/value layers; class layers use 0 (classes are 1-5)
 
 
-def _http_fetch(url):
-    """GET ``url``; on an HTTP error, raise with Earth Engine's own error message."""
+def _http_fetch(url, retries: int = 6, sleep=None):
+    """GET ``url``; on an HTTP error, raise with Earth Engine's own error message.
+
+    "429 Too Many Requests" (project busy, e.g. restricted mode) is retried with
+    increasing waits (5, 10, 20 ... s) before giving up.
+    """
+    import time
+
     import requests
 
-    response = requests.get(url, timeout=600)
+    sleep = sleep or time.sleep
+    for attempt in range(retries + 1):
+        response = requests.get(url, timeout=600)
+        if response.status_code != 429 or attempt == retries:
+            break
+        sleep(5 * 2 ** attempt)
     if response.status_code >= 400:
         try:
             detail = response.json()["error"]["message"]

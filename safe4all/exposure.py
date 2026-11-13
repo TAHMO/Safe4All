@@ -72,17 +72,7 @@ def roads_usable(ee, roads, region, scale: int = 1000, fetch=None) -> bool:
     this probe makes one such request now.
     """
     if fetch is None:
-        import requests
-
-        def fetch(url):
-            response = requests.get(url, timeout=600)
-            if response.status_code >= 400:
-                try:
-                    detail = response.json()["error"]["message"]
-                except Exception:
-                    detail = response.text[:200]
-                raise RuntimeError(f"HTTP {response.status_code}: {detail}")
-            return response.content
+        from .export import _http_fetch as fetch
     try:
         url = ee.Image(roads).toFloat().getDownloadURL(
             {"region": region, "scale": scale, "crs": "EPSG:4326", "format": "GEO_TIFF"})

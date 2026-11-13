@@ -69,13 +69,26 @@ def initialise_earth_engine(project: str | None = None):
         key_info = json.loads(Path(key_path).read_text())
         credentials = ee.ServiceAccountCredentials(key_info["client_email"], str(key_path))
         ee.Initialize(credentials, project=project)
-        return ee
+        return _patient(ee)
 
     try:
         ee.Initialize(project=project)
     except Exception:
         ee.Authenticate()
         ee.Initialize(project=project)
+    return _patient(ee)
+
+
+# Retries for "429 Too Many Requests". Many participants share one project, and in
+# restricted mode Earth Engine allows very few requests at once; the client waits
+# about 1, 2, 4 ... 256 s between attempts (~8 min at most) instead of giving up
+# after the default 5 short retries.
+EE_MAX_RETRIES = 9
+
+
+def _patient(ee):
+    if hasattr(ee.data, "setMaxRetries"):
+        ee.data.setMaxRetries(EE_MAX_RETRIES)
     return ee
 
 
