@@ -441,6 +441,66 @@ class RiskWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 _http_fetch("https://ee/x", retries=2, sleep=lambda _: None)
 
+    @unittest.skipUnless(importlib.util.find_spec("rasterio"), "rasterio not installed")
+    def test_multi_hazard_and_class_geotiffs_are_derived_from_saved_layers(self):
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        from safe4all.export import GEOTIFF_NODATA, download_geotiffs
+
+        def write(path, values):
+            with rasterio.open(path, "w", driver="GTiff", width=3, height=1, count=1, dtype="float32",
+                               crs="EPSG:4326", transform=from_origin(0, 1, 0.01, 0.01),
+                               nodata=GEOTIFF_NODATA) as target:
+                target.write(np.array([values], dtype="float32"), 1)
+
+        class Image:
+            def __init__(self, name):
+                self.name = name
+
+            def unmask(self, value):
+                return self
+
+            def toByte(self):
+                return self
+
+            def toFloat(self):
+                return self
+
+            def getDownloadURL(self, params):
+                raise RuntimeError("HTTP 400: User memory limit exceeded.")
+
+        class FakeEE:
+            def Image(self, image):
+                return image
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = Path(tmp_dir)
+            write(out / "Ghana_flood_risk.tif", [0.1, 0.9, GEOTIFF_NODATA])
+            write(out / "Ghana_drought_risk.tif", [0.5, 0.5, float("-inf")])  # EE: outside the study area
+            names = ["drought_risk_class", "multi_hazard_risk", "multi_hazard_risk_class"]
+            saved = download_geotiffs(FakeEE(), {n: Image(n) for n in names}, out, "Ghana", region=None,
+                                      log=lambda _: None, breaks={"drought_risk": [0.2, 0.4, 0.6, 0.8],
+                                                                  "multi_hazard_risk": [0.2, 0.4, 0.6, 0.8]})
+            self.assertEqual(sorted(p.name for p in saved),
+                             sorted(f"Ghana_{n}.tif" for n in names))
+            with rasterio.open(out / "Ghana_multi_hazard_risk.tif") as source:
+                np.testing.assert_allclose(source.read(1), [[0.3, 0.7, GEOTIFF_NODATA]], rtol=1e-6)
+            with rasterio.open(out / "Ghana_multi_hazard_risk_class.tif") as source:
+                self.assertEqual(source.read(1).tolist(), [[2, 4, 0]])  # 0 = nodata
+                self.assertEqual(source.nodata, 0)
+            with rasterio.open(out / "Ghana_drought_risk_class.tif") as source:
+                self.assertEqual(source.read(1).tolist(), [[3, 3, 0]])
+
+            # Downloaded Float32 files: -inf outside the study area becomes nodata.
+            from safe4all.export import _tag_nodata
+            write(out / "edge.tif", [float("-inf"), 0.4, float("nan")])
+            _tag_nodata(out / "edge.tif", GEOTIFF_NODATA)
+            with rasterio.open(out / "edge.tif") as source:
+                np.testing.assert_allclose(source.read(1), [[GEOTIFF_NODATA, 0.4, GEOTIFF_NODATA]], rtol=1e-6)
+                self.assertEqual(source.nodata, GEOTIFF_NODATA)
+
     def test_district_classes_and_ranks(self):
         values = [0.1, 0.9, float("nan"), 0.5, 0.5]
         self.assertEqual(assign_classes(values), ["Very Low", "Very High", "No data", "Moderate", "Moderate"])

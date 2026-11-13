@@ -487,7 +487,7 @@ def _download(image, path: Path, name: str, prefix: str, region, scale, fetch) -
 
 def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, scale: int = 1000,
                       fetch=None, log=print, asset_folder: str | None = None, wait_minutes: float = 90,
-                      poll_seconds: float = 20, sleep=None) -> list:
+                      poll_seconds: float = 20, sleep=None, breaks: dict | None = None) -> list:
     """Save each raster as a GeoTIFF in ``out_dir`` (no Drive export needed).
 
     Every layer is first requested as a direct download. Heavy layers (long time
@@ -495,7 +495,10 @@ def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, sca
     or 400). With ``asset_folder`` (e.g. ``projects/<EE_PROJECT>/assets/safe4all_exports``)
     those layers are then computed as Earth Engine batch tasks, which have much
     higher limits, into a temporary asset; the finished asset is downloaded and
-    deleted. Masked pixels are ``GEOTIFF_NODATA`` (0 for class layers).
+    deleted. With ``breaks`` (from ``classify_layers``), a failed multi-hazard risk
+    or ``<layer>_class`` raster is first derived locally from GeoTIFFs already saved
+    (see :func:`derive_geotiffs_locally`), which needs no Earth Engine compute.
+    Masked pixels are ``GEOTIFF_NODATA`` (0 for class layers).
     """
     fetch = fetch or _http_fetch
     out_dir = Path(out_dir)
@@ -513,6 +516,11 @@ def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, sca
         _tag_nodata(path, nodata)
         saved.append(path)
         log(f"Saved GeoTIFF: {path.name}")
+    if failed and breaks is not None:
+        derived = derive_geotiffs_locally(out_dir, prefix, list(failed), breaks, log)
+        saved += derived
+        for path in derived:
+            failed.pop(path.stem[len(prefix) + 1:], None)
     if failed and asset_folder:
         saved += _download_via_assets(ee, failed, out_dir, prefix, region, scale, fetch, log,
                                       asset_folder, wait_minutes, poll_seconds, sleep)
@@ -520,6 +528,76 @@ def download_geotiffs(ee, rasters: dict, out_dir: Path, prefix: str, region, sca
         log(f"Skipped: {sorted(failed)}")
     log(f"{len(saved)} of {len(rasters)} GeoTIFF(s) saved to {out_dir}")
     return saved
+
+
+def _break_values(breaks) -> list | None:
+    values = []
+    for value in breaks:
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+            continue
+        try:
+            values.append(float(value.getInfo()))
+        except Exception:
+            return None
+    return values if len(values) == 4 else None
+
+
+def derive_geotiffs_locally(out_dir: Path, prefix: str, names, breaks: dict, log=print) -> list:
+    """Build missing GeoTIFFs from ones already saved, with no Earth Engine request.
+
+    - ``multi_hazard_risk`` = mean of ``flood_risk`` and ``drought_risk`` (nodata where
+      either is nodata), exactly as the notebook defines it;
+    - ``<layer>_class`` = ``<layer>`` cut at ``breaks[<layer>]`` into classes 1-5 (a value
+      equal to a break falls in the lower class, as in ``classify``).
+
+    The inputs share one grid because they were downloaded with the same region,
+    scale and CRS. Returns the paths written; needs rasterio (skipped otherwise).
+    """
+    try:
+        import numpy as np
+        import rasterio
+    except ImportError:
+        return []
+    out_dir = Path(out_dir)
+    path = lambda name: out_dir / f"{prefix}_{name}.tif"  # noqa: E731
+    wanted = [n for n in names if n == "multi_hazard_risk"] + [n for n in names if n != "multi_hazard_risk"]
+    written = []
+    for name in wanted:
+        try:
+            if name == "multi_hazard_risk":
+                if not (path("flood_risk").exists() and path("drought_risk").exists()):
+                    continue
+                with rasterio.open(path("flood_risk")) as a, rasterio.open(path("drought_risk")) as b:
+                    flood, drought, profile = a.read(1), b.read(1), a.profile
+                    if (a.width, a.height, a.transform) != (b.width, b.height, b.transform):
+                        continue
+                invalid = ((flood == GEOTIFF_NODATA) | (drought == GEOTIFF_NODATA)
+                           | ~np.isfinite(flood) | ~np.isfinite(drought))
+                data = np.where(invalid, GEOTIFF_NODATA, (flood + drought) / 2).astype("float32")
+                profile.update(dtype="float32", nodata=GEOTIFF_NODATA, count=1)
+            elif name.endswith("_class"):
+                base = name[: -len("_class")]
+                values = _break_values(breaks.get(base, ())) if base in breaks else None
+                if values is None or not path(base).exists():
+                    continue
+                with rasterio.open(path(base)) as source:
+                    index, profile = source.read(1), source.profile
+                classes = np.ones(index.shape, dtype="uint8")
+                for value in values:
+                    classes += (index > value).astype("uint8")
+                data = np.where((index == GEOTIFF_NODATA) | ~np.isfinite(index), 0, classes).astype("uint8")
+                profile.update(dtype="uint8", nodata=0, count=1)
+            else:
+                continue
+            with rasterio.open(path(name), "w", **profile) as target:
+                target.write(data, 1)
+        except Exception as error:
+            log(f"Could not derive {name} locally ({str(error)[:150]})")
+            continue
+        written.append(path(name))
+        log(f"Saved GeoTIFF (derived from saved layers): {path(name).name}")
+    return written
 
 
 def _create_folder(ee, path: str) -> None:
@@ -607,8 +685,13 @@ def _download_via_assets(ee, failed: dict, out_dir: Path, prefix: str, region, s
 
 
 def _tag_nodata(path: Path, nodata) -> None:
-    """Record the nodata value in the GeoTIFF so GIS software hides masked pixels (needs rasterio)."""
+    """Make masked pixels ``nodata`` and record it so GIS software hides them (needs rasterio).
+
+    Earth Engine writes pixels outside the clipped study area as -inf in Float32
+    downloads (``unmask`` only fills inside the footprint); they are set to ``nodata``.
+    """
     try:
+        import numpy as np
         import rasterio
     except ImportError:
         return
@@ -619,6 +702,12 @@ def _tag_nodata(path: Path, nodata) -> None:
     logger.setLevel(logging.ERROR)  # hides a harmless "legacy Deflate codec" warning
     try:
         with rasterio.open(path, "r+") as dataset:
+            if np.dtype(dataset.dtypes[0]).kind == "f":
+                data = dataset.read(1)
+                invalid = ~np.isfinite(data)
+                if invalid.any():
+                    data[invalid] = nodata
+                    dataset.write(data, 1)
             dataset.nodata = nodata
     except Exception:
         pass
